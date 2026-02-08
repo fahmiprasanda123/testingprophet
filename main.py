@@ -11,10 +11,6 @@ import tensorflow as tf
 import math
 
 class HybridForecaster:
-    """
-    Kelas Hibrida Profesional: Prophet + LSTM.
-    Fitur Baru: Train/Test Split untuk Validasi Akurasi Tesis.
-    """
 
     def __init__(self, seed: int = 42):
         self.prophet_model = None
@@ -31,9 +27,7 @@ class HybridForecaster:
         tf.random.set_seed(seed)
 
     def generate_dummy_data(self, start_date='2021-01-01', days=1825):
-        """
-        Membuat data 5 Tahun (2021 - 2026).
-        """
+
         dates = pd.date_range(start=start_date, periods=days)
         
         # 1. Tren Jangka Panjang
@@ -63,10 +57,7 @@ class HybridForecaster:
         return np.array(X), np.array(Y)
 
     def train_and_evaluate(self, df, test_days=365):
-        """
-        Fungsi Utama: Membagi data, Melatih, dan Menguji (Validasi).
-        test_days: Jumlah hari terakhir yang dijadikan data uji (misal 1 tahun terakhir).
-        """
+
         # 1. SPLIT DATA
         split_idx = len(df) - test_days
         self.df_train = df.iloc[:split_idx].copy()
