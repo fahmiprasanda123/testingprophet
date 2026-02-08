@@ -6,3 +6,5 @@ source venv/bin/activate
 pip install --upgrade pip
 - install library
 pip install prophet pandas numpy matplotlib
+pip install tensorflow scikit-learn
+pip install plotly
