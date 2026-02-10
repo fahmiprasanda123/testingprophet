@@ -104,50 +104,65 @@ class HybridForecaster:
 
     def _evaluate_on_test_set(self):
         """
-        Memprediksi Data Uji dan membandingkan dengan Data Asli.
+        [UPDATED] Memprediksi Data Uji dan membandingkan:
+        Prophet (Baseline) vs Hybrid (Prophet + LSTM).
         """
-        # A. Prediksi Prophet pada masa Data Uji
+        # A. Prediksi Prophet pada masa Data Uji (Baseline)
         future_test = self.df_test[['ds']].copy()
         prophet_forecast_test = self.prophet_model.predict(future_test)
         
         # B. Prediksi LSTM pada masa Data Uji (Recursive)
-        # Ambil data residual terakhir dari Training sebagai 'start'
         last_residuals = self.df_train['residual'].values[-self.look_back:]
         last_residuals_scaled = self.scaler.transform(last_residuals.reshape(-1, 1))
         
         curr_input = last_residuals_scaled.reshape(1, self.look_back, 1)
         lstm_predictions_scaled = []
         
-        steps = len(self.df_test) # Prediksi sepanjang data uji
-        
+        steps = len(self.df_test) 
         print(f"       -> Menggenerate {steps} hari prediksi LSTM...")
         
         for i in range(steps):
             pred = self.lstm_model.predict(curr_input, verbose=0)
             lstm_predictions_scaled.append(pred[0, 0])
-            
-            # Update window (Geser dan masukkan prediksi baru)
             new_observation = pred.reshape(1, 1, 1)
             curr_input = np.append(curr_input[:, 1:, :], new_observation, axis=1)
             
         # Kembalikan ke skala asli
         lstm_predictions = self.scaler.inverse_transform(np.array(lstm_predictions_scaled).reshape(-1, 1))
         
-        # C. Gabungkan
+        # C. Gabungkan Data
         self.test_forecast = self.df_test.copy()
-        self.test_forecast['yhat_prophet'] = prophet_forecast_test['yhat'].values
+        self.test_forecast['yhat_prophet'] = prophet_forecast_test['yhat'].values # Baseline
         self.test_forecast['lstm_correction'] = lstm_predictions
-        self.test_forecast['hybrid_pred'] = self.test_forecast['yhat_prophet'] + self.test_forecast['lstm_correction']
+        self.test_forecast['hybrid_pred'] = self.test_forecast['yhat_prophet'] + self.test_forecast['lstm_correction'] # Proposed
         
-        # D. Hitung Error (Metrik Akademis)
-        mse = mean_squared_error(self.test_forecast['y'], self.test_forecast['hybrid_pred'])
-        rmse = math.sqrt(mse)
-        mae = mean_absolute_error(self.test_forecast['y'], self.test_forecast['hybrid_pred'])
+        # D. HITUNG PERBANDINGAN ERROR (BASELINE vs HYBRID)
+        # 1. Error Prophet Murni
+        mse_p = mean_squared_error(self.test_forecast['y'], self.test_forecast['yhat_prophet'])
+        rmse_p = math.sqrt(mse_p)
+        mae_p = mean_absolute_error(self.test_forecast['y'], self.test_forecast['yhat_prophet'])
         
-        print(f"\n[HASIL VALIDASI DATA UJI]")
-        print(f"RMSE (Root Mean Squared Error): {rmse:.4f}")
-        print(f"MAE  (Mean Absolute Error)    : {mae:.4f}")
-        print("Note: Semakin kecil error, semakin akurat model.")
+        # 2. Error Hybrid
+        mse_h = mean_squared_error(self.test_forecast['y'], self.test_forecast['hybrid_pred'])
+        rmse_h = math.sqrt(mse_h)
+        mae_h = mean_absolute_error(self.test_forecast['y'], self.test_forecast['hybrid_pred'])
+        
+        # 3. Hitung Peningkatan (Improvement)
+        improv_rmse = ((rmse_p - rmse_h) / rmse_p) * 100
+        
+        print(f"\n{'='*40}")
+        print(f"HASIL PERBANDINGAN (BASELINE VS HYBRID)")
+        print(f"{'='*40}")
+        print(f"{'METRIK':<10} | {'PROPHET':<10} | {'HYBRID':<10} | {'IMPROVEMENT':<10}")
+        print(f"{'-'*46}")
+        print(f"{'RMSE':<10} | {rmse_p:.4f}     | {rmse_h:.4f}     | {improv_rmse:.2f}%")
+        print(f"{'MAE':<10}  | {mae_p:.4f}      | {mae_h:.4f}      | ")
+        print(f"{'='*40}")
+        
+        if improv_rmse > 0:
+            print(f"[KESIMPULAN] Model Hybrid berhasil mengurangi error sebesar {improv_rmse:.2f}%")
+        else:
+            print("[KESIMPULAN] Model Hybrid tidak lebih baik dari Prophet standar.")
 
     def visualize_validation(self):
         """Visualisasi Khusus: Train vs Test vs Prediksi"""
