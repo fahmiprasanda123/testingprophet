@@ -8,3 +8,5 @@ pip install --upgrade pip
 pip install prophet pandas numpy matplotlib
 pip install tensorflow scikit-learn
 pip install plotly
+pip install yfinance
+pip install requests

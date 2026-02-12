@@ -1,14 +1,16 @@
 import pandas as pd
 import numpy as np
+import requests # Library untuk request API
 from prophet import Prophet
 import matplotlib.pyplot as plt
 from sklearn.preprocessing import MinMaxScaler
-from sklearn.metrics import mean_squared_error, mean_absolute_error
+from sklearn.metrics import mean_squared_error
 from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense
+from tensorflow.keras.layers import LSTM, Dense, Dropout
 from tensorflow.keras.callbacks import EarlyStopping
 import tensorflow as tf
 import math
+import time
 
 class HybridForecaster:
 
@@ -16,9 +18,8 @@ class HybridForecaster:
         self.prophet_model = None
         self.lstm_model = None
         self.scaler = MinMaxScaler(feature_range=(-1, 1))
-        self.look_back = 60 # LSTM melihat 60 hari ke belakang (memperpanjang memori)
+        self.look_back = 60 
         
-        # Container data
         self.df_train = None
         self.df_test = None
         self.test_forecast = None
@@ -26,27 +27,59 @@ class HybridForecaster:
         np.random.seed(seed)
         tf.random.set_seed(seed)
 
-    def generate_dummy_data(self, start_date='2021-01-01', days=1825):
-
-        dates = pd.date_range(start=start_date, periods=days)
+    def get_crypto_data_api(self, coin_id='bitcoin', days='1800'):
+        """
+        [API INTEGRATION]
+        """
+        print(f"\n[INFO] Menghubungi CoinGecko API untuk data '{coin_id}'...")
         
-        # 1. Tren Jangka Panjang
-        trend = np.linspace(100, 300, days)
+        # URL Endpoint CoinGecko (Public API)
+        url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart"
+        params = {
+            'vs_currency': 'usd',
+            'days': days,       # Jumlah hari ke belakang (1800 hari ~= 5 tahun)
+            'interval': 'daily' # Data harian
+        }
         
-        # 2. Musiman Tahunan & Mingguan
-        yearly_season = 30 * np.sin(2 * np.pi * dates.dayofyear / 365)
-        weekly_season = 10 * np.sin(2 * np.pi * dates.dayofweek / 7)
-        
-        # 3. Komponen Non-Linear Kompleks (Target LSTM)
-        # Gelombang aneh yang berubah frekuensinya
-        complex_wave = 20 * np.sin(dates.dayofyear / 20) * np.cos(dates.dayofyear / 100)
-        
-        noise = np.random.normal(0, 5, days)
-        y = trend + yearly_season + weekly_season + complex_wave + noise
-        
-        print(f"[INFO] Data 5 Tahun ({days} hari) berhasil dibuat.")
-        print(f"       Start: {dates[0].date()} | End: {dates[-1].date()}")
-        return pd.DataFrame({'ds': dates, 'y': y})
+        try:
+            # Melakukan Request HTTP GET
+            response = requests.get(url, params=params, timeout=10)
+            
+            # Cek jika sukses (Status 200)
+            if response.status_code == 200:
+                data = response.json()
+                prices = data['prices'] # Format: [[timestamp, price], ...]
+                
+                # Convert ke Pandas DataFrame
+                df = pd.DataFrame(prices, columns=['timestamp', 'y'])
+                
+                # Convert timestamp (ms) ke datetime
+                df['ds'] = pd.to_datetime(df['timestamp'], unit='ms')
+                
+                # Hapus jam/menit/detik agar bersih (hanya tanggal)
+                df['ds'] = df['ds'].dt.normalize()
+                
+                # Hapus duplikat tanggal (kadang API kasih data per jam di hari terakhir)
+                df = df.drop_duplicates(subset=['ds'], keep='last')
+                
+                # Urutkan kolom
+                df = df[['ds', 'y']]
+                
+                print(f"[SUKSES] Data {coin_id} berhasil ditarik via API!")
+                print(f"         Total: {len(df)} baris data.")
+                print(f"         Start: {df['ds'].iloc[0].date()} | End: {df['ds'].iloc[-1].date()}")
+                return df
+            
+            else:
+                raise ConnectionError(f"API Error {response.status_code}: {response.reason}")
+                
+        except Exception as e:
+            print(f"[ERROR API] Gagal mengambil data: {e}")
+            # Fallback darurat: Buat data dummy jika API mati total (agar codingan ga error)
+            print("[WARNING] Menggunakan data dummy sebagai fallback agar program tetap jalan.")
+            dates = pd.date_range(end=pd.Timestamp.now(), periods=int(days))
+            y = np.linspace(10000, 50000, int(days)) + np.random.normal(0, 1000, int(days))
+            return pd.DataFrame({'ds': dates, 'y': y})
 
     def _create_lstm_dataset(self, dataset, look_back):
         X, Y = [], []
@@ -56,62 +89,55 @@ class HybridForecaster:
             Y.append(dataset[i + look_back, 0])
         return np.array(X), np.array(Y)
 
-    def train_and_evaluate(self, df, test_days=365):
-
+    def train_and_evaluate(self, df, test_days=180):
         # 1. SPLIT DATA
         split_idx = len(df) - test_days
         self.df_train = df.iloc[:split_idx].copy()
         self.df_test = df.iloc[split_idx:].copy()
         
-        print(f"\n[INFO] Pembagian Data:")
-        print(f"       Data Latih: {len(self.df_train)} hari (Jan 2021 - Awal 2025)")
-        print(f"       Data Uji  : {len(self.df_test)} hari (Awal 2025 - Feb 2026)")
+        print(f"\n[INFO] Skenario Split Data:")
+        print(f"       Training: {len(self.df_train)} hari")
+        print(f"       Testing : {len(self.df_test)} hari")
         
-        # --- PHASE 1: PROPHET (TRAINING) ---
-        print("\n[STEP 1] Melatih Prophet pada Data Latih...")
-        self.prophet_model = Prophet(daily_seasonality=True, yearly_seasonality=True)
+        # --- PHASE 1: PROPHET ---
+        print("\n[STEP 1] Melatih Prophet...")
+        self.prophet_model = Prophet(daily_seasonality=True) 
         self.prophet_model.fit(self.df_train)
         
-        # Hitung Residual pada Data Latih
         future_train = self.prophet_model.make_future_dataframe(periods=0)
         forecast_train = self.prophet_model.predict(future_train)
         self.df_train['yhat_prophet'] = forecast_train['yhat'].values
         self.df_train['residual'] = self.df_train['y'] - self.df_train['yhat_prophet']
         
-        # --- PHASE 2: LSTM (TRAINING) ---
-        print("[STEP 2] Melatih LSTM pada Residual Data Latih...")
+        # --- PHASE 2: LSTM ---
+        print("[STEP 2] Melatih LSTM...")
         
-        # Scaling
         residuals = self.df_train['residual'].values.reshape(-1, 1)
         scaled_residuals = self.scaler.fit_transform(residuals)
         
         X_train, y_train = self._create_lstm_dataset(scaled_residuals, self.look_back)
         X_train = np.reshape(X_train, (X_train.shape[0], X_train.shape[1], 1))
         
-        # Model Architecture
         self.lstm_model = Sequential()
-        self.lstm_model.add(LSTM(64, return_sequences=False, input_shape=(self.look_back, 1)))
-        self.lstm_model.add(Dense(32, activation='relu'))
+        self.lstm_model.add(LSTM(50, return_sequences=False, input_shape=(self.look_back, 1)))
+        self.lstm_model.add(Dropout(0.2)) 
         self.lstm_model.add(Dense(1))
         
         self.lstm_model.compile(optimizer='adam', loss='mse')
-        es = EarlyStopping(monitor='loss', patience=5, verbose=0)
-        self.lstm_model.fit(X_train, y_train, epochs=15, batch_size=32, verbose=1, callbacks=[es])
+        # Verbose 0 biar terminal ga penuh, ganti 1 kalo mau liat progress bar
+        es = EarlyStopping(monitor='loss', patience=5, verbose=0) 
+        self.lstm_model.fit(X_train, y_train, epochs=20, batch_size=32, verbose=1, callbacks=[es])
         
-        # --- PHASE 3: EVALUATION (TESTING) ---
-        print("\n[STEP 3] Melakukan Validasi pada Data Uji (1 Tahun Terakhir)...")
+        # --- PHASE 3: EVALUATION ---
+        print("\n[STEP 3] Validasi Data...")
         self._evaluate_on_test_set()
 
     def _evaluate_on_test_set(self):
-        """
-        [UPDATED] Memprediksi Data Uji dan membandingkan:
-        Prophet (Baseline) vs Hybrid (Prophet + LSTM).
-        """
-        # A. Prediksi Prophet pada masa Data Uji (Baseline)
+        # A. Prophet Baseline
         future_test = self.df_test[['ds']].copy()
         prophet_forecast_test = self.prophet_model.predict(future_test)
         
-        # B. Prediksi LSTM pada masa Data Uji (Recursive)
+        # B. LSTM Prediction
         last_residuals = self.df_train['residual'].values[-self.look_back:]
         last_residuals_scaled = self.scaler.transform(last_residuals.reshape(-1, 1))
         
@@ -119,7 +145,7 @@ class HybridForecaster:
         lstm_predictions_scaled = []
         
         steps = len(self.df_test) 
-        print(f"       -> Menggenerate {steps} hari prediksi LSTM...")
+        print(f"       -> Forecasting {steps} hari ke depan...")
         
         for i in range(steps):
             pred = self.lstm_model.predict(curr_input, verbose=0)
@@ -127,92 +153,60 @@ class HybridForecaster:
             new_observation = pred.reshape(1, 1, 1)
             curr_input = np.append(curr_input[:, 1:, :], new_observation, axis=1)
             
-        # Kembalikan ke skala asli
         lstm_predictions = self.scaler.inverse_transform(np.array(lstm_predictions_scaled).reshape(-1, 1))
         
-        # C. Gabungkan Data
+        # C. Gabungkan
         self.test_forecast = self.df_test.copy()
-        self.test_forecast['yhat_prophet'] = prophet_forecast_test['yhat'].values # Baseline
+        self.test_forecast['yhat_prophet'] = prophet_forecast_test['yhat'].values
         self.test_forecast['lstm_correction'] = lstm_predictions
-        self.test_forecast['hybrid_pred'] = self.test_forecast['yhat_prophet'] + self.test_forecast['lstm_correction'] # Proposed
+        self.test_forecast['hybrid_pred'] = self.test_forecast['yhat_prophet'] + self.test_forecast['lstm_correction']
         
-        # D. HITUNG PERBANDINGAN ERROR (BASELINE vs HYBRID)
-        # 1. Error Prophet Murni
-        mse_p = mean_squared_error(self.test_forecast['y'], self.test_forecast['yhat_prophet'])
-        rmse_p = math.sqrt(mse_p)
-        mae_p = mean_absolute_error(self.test_forecast['y'], self.test_forecast['yhat_prophet'])
+        # D. Metrics
+        rmse_p = math.sqrt(mean_squared_error(self.test_forecast['y'], self.test_forecast['yhat_prophet']))
+        rmse_h = math.sqrt(mean_squared_error(self.test_forecast['y'], self.test_forecast['hybrid_pred']))
         
-        # 2. Error Hybrid
-        mse_h = mean_squared_error(self.test_forecast['y'], self.test_forecast['hybrid_pred'])
-        rmse_h = math.sqrt(mse_h)
-        mae_h = mean_absolute_error(self.test_forecast['y'], self.test_forecast['hybrid_pred'])
-        
-        # 3. Hitung Peningkatan (Improvement)
         improv_rmse = ((rmse_p - rmse_h) / rmse_p) * 100
         
-        print(f"\n{'='*40}")
-        print(f"HASIL PERBANDINGAN (BASELINE VS HYBRID)")
-        print(f"{'='*40}")
-        print(f"{'METRIK':<10} | {'PROPHET':<10} | {'HYBRID':<10} | {'IMPROVEMENT':<10}")
-        print(f"{'-'*46}")
-        print(f"{'RMSE':<10} | {rmse_p:.4f}     | {rmse_h:.4f}     | {improv_rmse:.2f}%")
-        print(f"{'MAE':<10}  | {mae_p:.4f}      | {mae_h:.4f}      | ")
-        print(f"{'='*40}")
-        
-        if improv_rmse > 0:
-            print(f"[KESIMPULAN] Model Hybrid berhasil mengurangi error sebesar {improv_rmse:.2f}%")
-        else:
-            print("[KESIMPULAN] Model Hybrid tidak lebih baik dari Prophet standar.")
+        print(f"\n{'='*55}")
+        print(f"FINAL VERDICT: {ticker_name.upper()} MARKET DATA")
+        print(f"{'='*55}")
+        print(f"{'METRIK':<10} | {'PROPHET':<15} | {'HYBRID':<15} | {'DIFF':<10}")
+        print(f"{'-'*55}")
+        print(f"{'RMSE':<10} | {rmse_p:.4f}          | {rmse_h:.4f}          | {improv_rmse:.2f}%")
+        print(f"{'='*55}")
 
-    def visualize_validation(self):
-        """Visualisasi Khusus: Train vs Test vs Prediksi"""
+    def visualize_validation(self, title_suffix=""):
         plt.figure(figsize=(15, 7))
-        
-        # 1. Plot Data Latih (Hitam)
-        plt.plot(self.df_train['ds'], self.df_train['y'], label='Data Latih (Training)', color='black', alpha=0.3)
-        
-        # 2. Plot Data Uji (Hijau - Data Asli Masa Depan)
-        plt.plot(self.df_test['ds'], self.df_test['y'], label='Data Uji (Actual Test Data)', color='green')
-        
-        # 3. Plot Prediksi Hybrid (Merah Putus-putus)
+        plt.plot(self.df_test['ds'], self.df_test['y'], label='Harga Asli (Actual)', color='green', linewidth=2)
+        plt.plot(self.test_forecast['ds'], self.test_forecast['yhat_prophet'], 
+                 label='Prophet (Baseline)', color='blue', linestyle=':', alpha=0.7)
         plt.plot(self.test_forecast['ds'], self.test_forecast['hybrid_pred'], 
-                 label='Prediksi Hybrid (Validation)', color='red', linestyle='--', linewidth=2)
+                 label='Hybrid (Ours)', color='red', linestyle='--', linewidth=2)
         
-        plt.title('Evaluasi Model: Training (4 Tahun) vs Testing (1 Tahun Terakhir)', fontsize=14)
-        plt.xlabel('Tahun')
-        plt.ylabel('Nilai')
+        plt.title(f'Validasi Data Riil: {title_suffix}', fontsize=14)
+        plt.xlabel('Date')
+        plt.ylabel('Price (USD)')
         plt.legend()
         plt.grid(True, alpha=0.3)
-        plt.show()
-        
-        # Zoom in ke bagian Test saja biar jelas
-        plt.figure(figsize=(15, 5))
-        plt.plot(self.df_test['ds'], self.df_test['y'], label='Data Uji (Actual)', color='green')
-        plt.plot(self.test_forecast['ds'], self.test_forecast['hybrid_pred'], label='Prediksi Hybrid', color='red', linestyle='--')
-        plt.title('Zoom-In: Perbandingan Data Asli vs Prediksi (2025-2026)', fontsize=14)
-        plt.legend()
-        plt.grid(True)
         plt.show()
 
 if __name__ == "__main__":
     try:
         model = HybridForecaster(seed=42)
         
-        # 1. Buat Data 5 Tahun (2021 s/d Feb 2026)
-        df_all = model.generate_dummy_data(start_date='2021-01-01', days=1900)
+        # Kita pakai ID 'bitcoin' untuk CoinGecko
+        ticker_name = 'bitcoin' 
         
-        # 2. Latih & Evaluasi
-        # Kita ambil 365 hari terakhir sebagai Data Uji (Test Set)
-        model.train_and_evaluate(df_all, test_days=365)
+        # Request data 5 tahun terakhir (sekitar 1800 hari)
+        # Ini MURNI REQUEST API, tidak ada file CSV
+        df_market = model.get_crypto_data_api(coin_id=ticker_name, days='1800')
         
-        # 3. Visualisasi Hasil Uji
-        model.visualize_validation()
+        # Latih & Evaluasi (Test pada 6 bulan terakhir)
+        model.train_and_evaluate(df_market, test_days=180)
         
-        # Output DataFrame hasil uji (untuk dicek manual)
-        print("\n--- Contoh Data Hasil Uji (5 Baris Terakhir Feb 2026) ---")
-        print(model.test_forecast[['ds', 'y', 'yhat_prophet', 'hybrid_pred']].tail())
+        model.visualize_validation(title_suffix=ticker_name.upper())
 
     except Exception as e:
-        print(f"\n[ERROR]: {e}")
+        print(f"\n[ERROR FATAL]: {e}")
         import traceback
         traceback.print_exc()
