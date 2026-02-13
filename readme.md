@@ -10,3 +10,5 @@ pip install tensorflow scikit-learn
 pip install plotly
 pip install yfinance
 pip install requests
+
+pip install streamlit plotly
