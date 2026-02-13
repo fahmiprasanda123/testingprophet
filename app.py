@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import requests
+import time
 from prophet import Prophet
 from sklearn.preprocessing import MinMaxScaler
 from tensorflow.keras.models import Sequential
@@ -17,73 +18,63 @@ st.title("🚀 Hybrid Prophet-LSTM Forecasting Engine")
 st.markdown("""
 Aplikasi ini menggabungkan kekuatan statistik **Facebook Prophet** (untuk tren) 
 dan **LSTM Deep Learning** (untuk volatilitas) guna memprediksi harga aset kripto.
-**Data Source:** Binance Public API (Real-Time).
+**Data Source:** CoinGecko Public API.
 """)
 
 # --- SIDEBAR (INPUT USER) ---
 st.sidebar.header("⚙️ Konfigurasi Model")
 
-# Mapping nama koin ke Simbol Binance (Pair USDT)
+# Pilihan Koin (ID CoinGecko)
 coin_options = {
-    "Bitcoin (BTC)": "BTCUSDT",
-    "Ethereum (ETH)": "ETHUSDT",
-    "Binance Coin (BNB)": "BNBUSDT",
-    "Solana (SOL)": "SOLUSDT",
-    "Ripple (XRP)": "XRPUSDT"
+    "Bitcoin (BTC)": "bitcoin",
+    "Ethereum (ETH)": "ethereum",
+    "Binance Coin (BNB)": "binancecoin",
+    "Solana (SOL)": "solana",
+    "Ripple (XRP)": "ripple"
 }
 
 selected_coin_name = st.sidebar.selectbox("Pilih Aset Kripto:", list(coin_options.keys()))
-coin_symbol = coin_options[selected_coin_name]
+coin_id = coin_options[selected_coin_name]
 
-# Slider dibatasi max 1000 karena limit sekali call Binance API adalah 1000 candle
-days_history = st.sidebar.slider("Data Historis (Hari):", min_value=365, max_value=1000, value=1000, step=100)
+days_history = st.sidebar.slider("Data Historis (Hari):", min_value=365, max_value=2000, value=1000, step=100)
 test_days = st.sidebar.slider("Durasi Validasi (Hari):", min_value=30, max_value=365, value=90, step=30)
 epochs = st.sidebar.slider("Training Epochs (LSTM):", min_value=5, max_value=50, value=15, step=5)
 
-# --- FUNGSI DATA LOADER (BINANCE API) ---
+# --- FUNGSI DATA LOADER (COINGECKO DENGAN RETRY) ---
 @st.cache_data(ttl=3600, show_spinner=False) 
-def get_binance_data(symbol, limit):
-    # Endpoint Binance untuk Data Candlestick (K-Lines)
-    url = "https://api.binance.com/api/v3/klines"
+def get_crypto_data(coin_id, days):
+    url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart"
+    params = {'vs_currency': 'usd', 'days': days, 'interval': 'daily'}
     
-    params = {
-        'symbol': symbol,
-        'interval': '1d', # Data Harian
-        'limit': limit    # Max 1000 data
+    # Header Browser (Penting!)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
     }
     
-    try:
-        response = requests.get(url, params=params, timeout=10)
-        
-        if response.status_code == 200:
-            data = response.json()
-            # Format Binance: [Open Time, Open, High, Low, Close, Volume, ...]
-            # Kita butuh index 0 (Time) dan index 4 (Close Price)
+    # Mekanisme Retry (Coba 3x jika gagal)
+    for attempt in range(3):
+        try:
+            response = requests.get(url, params=params, headers=headers, timeout=10)
             
-            df = pd.DataFrame(data, columns=[
-                'open_time', 'open', 'high', 'low', 'close', 'volume',
-                'close_time', 'q_asset_vol', 'num_trades', 'taker_base_vol', 'taker_quote_vol', 'ignore'
-            ])
+            if response.status_code == 200:
+                data = response.json()
+                df = pd.DataFrame(data['prices'], columns=['timestamp', 'y'])
+                df['ds'] = pd.to_datetime(df['timestamp'], unit='ms').dt.normalize()
+                df = df.drop_duplicates(subset=['ds'], keep='last')[['ds', 'y']]
+                return df
+            elif response.status_code == 429:
+                # Jika kena limit, tunggu sebentar lalu coba lagi
+                time.sleep(2)
+                continue
+            else:
+                st.error(f"API Error: {response.status_code}")
+                return None
+        except Exception as e:
+            time.sleep(1)
+            continue
             
-            # Ambil hanya kolom waktu dan harga close
-            df = df[['open_time', 'close']]
-            df.columns = ['timestamp', 'y']
-            
-            # Konversi tipe data
-            df['ds'] = pd.to_datetime(df['timestamp'], unit='ms').dt.normalize()
-            df['y'] = df['y'].astype(float) # Harga di Binance string, harus jadi float
-            
-            # Bersihkan dan urutkan
-            df = df[['ds', 'y']].sort_values('ds')
-            return df
-            
-        else:
-            st.error(f"Binance API Error: {response.status_code}")
-            return None
-            
-    except Exception as e:
-        st.error(f"Connection Error: {e}")
-        return None
+    st.error("Gagal mengambil data setelah 3x percobaan. Coba refresh halaman.")
+    return None
 
 # --- CLASS MODEL ---
 class HybridForecaster:
@@ -92,6 +83,7 @@ class HybridForecaster:
         self.look_back = 60
         self.prophet_model = None
         self.lstm_model = None
+        # Fix seed agar hasil konsisten
         tf.random.set_seed(42)
         np.random.seed(42)
 
@@ -163,8 +155,8 @@ class HybridForecaster:
 
 # --- MAIN EXECUTION ---
 if st.button("Mulai Analisis 🔮"):
-    # 1. Panggil fungsi data (Binance Version)
-    df = get_binance_data(coin_symbol, days_history)
+    # 1. Panggil fungsi data (CoinGecko Version)
+    df = get_crypto_data(coin_id, days_history)
     
     if df is not None:
         st.success(f"Data {selected_coin_name} berhasil diambil! ({len(df)} baris)")
